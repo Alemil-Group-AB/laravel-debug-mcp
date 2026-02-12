@@ -1,0 +1,6 @@
+# Example authorized_keys line (RECOMMENDED: forced command).
+# Replace the ssh-ed25519 key with your real key.
+# The 'command=' part forces OpenSSH to always execute laravel-diag and ignore the client-supplied command.
+# The options further restrict port/X11 forwarding, tty, etc.
+
+command="/usr/local/bin/laravel-diag",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... your-key-comment

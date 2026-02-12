@@ -1,0 +1,536 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * laravel-diag (remote runner)
+ *
+ * Reads JSON from STDIN:
+ *   {"action":"logs.tail","params":{"lines":200,"file":"laravel.log"}}
+ *
+ * Writes JSON to STDOUT:
+ *   {"ok":true,"output":"...","meta":{...}}
+ *
+ * Hardening notes:
+ * - Only allowlisted actions are supported.
+ * - Inputs are validated (length, charset, basenames only).
+ * - Health URL is restricted to loopback (prevents SSRF / internal scanning).
+ * - No direct reading of .env or other sensitive config files.
+ */
+
+ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
+const ENV_FILE = '/etc/laravel-diag.env';
+
+function respond(bool $ok, string $output, array $meta = []): void {
+  $payload = [
+    'ok' => $ok,
+    'output' => $output,
+    'meta' => (object)$meta,
+  ];
+  fwrite(STDOUT, json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
+  exit($ok ? 0 : 1);
+}
+
+function loadEnvFile(string $path): void {
+  if (!is_readable($path)) return;
+  $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+  if ($lines === false) return;
+
+  foreach ($lines as $line) {
+    $line = trim($line);
+    if ($line === '' || str_starts_with($line, '#')) continue;
+    $pos = strpos($line, '=');
+    if ($pos === false) continue;
+    $key = trim(substr($line, 0, $pos));
+    $val = trim(substr($line, $pos + 1));
+    // Strip optional surrounding quotes
+    if ((str_starts_with($val, '"') && str_ends_with($val, '"')) || (str_starts_with($val, "'") && str_ends_with($val, "'"))) {
+      $val = substr($val, 1, -1);
+    }
+    if ($key !== '' && getenv($key) === false) {
+      putenv($key . '=' . $val);
+    }
+  }
+}
+
+function getEnv(string $key, ?string $default = null): ?string {
+  $v = getenv($key);
+  if ($v === false || $v === '') return $default;
+  return $v;
+}
+
+function requireEnv(string $key): string {
+  $v = getEnv($key);
+  if ($v === null) respond(false, "Missing required config: {$key}");
+  return $v;
+}
+
+function truncate(string $s, int $maxChars): string {
+  if ($maxChars <= 0) return '';
+  if (mb_strlen($s) <= $maxChars) return $s;
+  return mb_substr($s, 0, $maxChars) . "\n\n…(truncated)…";
+}
+
+function redact(string $s): string {
+  $patterns = [
+    // Laravel APP_KEY
+    '/APP_KEY\s*=\s*base64:[A-Za-z0-9+\/=]{20,}/' => 'APP_KEY=base64:[REDACTED]',
+    '/APP_KEY\s*=\s*[A-Za-z0-9+\/=]{20,}/' => 'APP_KEY=[REDACTED]',
+
+    // Common env secrets
+    '/\b(AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_SESSION_TOKEN)\s*=\s*[^\s]+/' => '$1=[REDACTED]',
+    '/\b(DATABASE_URL|REDIS_URL|MAIL_URL)\s*=\s*[^\s]+/' => '$1=[REDACTED]',
+
+    // Password-ish assignments
+    '/(password|passwd|pwd)\s*[:=]\s*["\']?[^"\'>\s]+["\']?/i' => '$1=[REDACTED]',
+
+    // Bearer tokens
+    '/Authorization:\s*Bearer\s+[A-Za-z0-9\-_\.=]{10,}/i' => 'Authorization: Bearer [REDACTED]',
+    '/Bearer\s+[A-Za-z0-9\-_\.=]{10,}/' => 'Bearer [REDACTED]',
+
+    // JWT-ish blobs
+    '/\beyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\b/' => '[REDACTED_JWT]',
+
+    // Long hex tokens
+    '/\b[a-f0-9]{32,}\b/i' => '[REDACTED_HEX]',
+  ];
+
+  foreach ($patterns as $re => $rep) {
+    $s = preg_replace($re, $rep, $s) ?? $s;
+  }
+  return $s;
+}
+
+function isSafeBasename(?string $name): bool {
+  if ($name === null) return true;
+  if ($name === '' || strlen($name) > 128) return false;
+  if (str_contains($name, '/') || str_contains($name, '\\')) return false;
+  if (str_contains($name, "\0")) return false;
+  // allow letters, numbers, dots, dashes, underscores
+  return (bool)preg_match('/^[A-Za-z0-9._-]+$/', $name);
+}
+
+function findLatestLogFile(string $logDir): ?string {
+  if (!is_dir($logDir)) return null;
+  $files = glob($logDir . DIRECTORY_SEPARATOR . 'laravel*.log');
+  if (!$files) return null;
+
+  $best = null;
+  $bestMtime = -1;
+  foreach ($files as $f) {
+    if (!is_file($f)) continue;
+    $m = filemtime($f);
+    if ($m !== false && $m > $bestMtime) {
+      $bestMtime = $m;
+      $best = $f;
+    }
+  }
+  return $best;
+}
+
+function resolveLogFile(string $logDir, ?string $basename): ?string {
+  if (!is_dir($logDir)) return null;
+  if ($basename === null || $basename === '') {
+    return findLatestLogFile($logDir);
+  }
+  if (!isSafeBasename($basename)) return null;
+  $path = $logDir . DIRECTORY_SEPARATOR . $basename;
+  if (!is_file($path)) return null;
+  // Ensure it's under logDir (defense-in-depth)
+  $realDir = realpath($logDir);
+  $realFile = realpath($path);
+  if ($realDir === false || $realFile === false) return null;
+  if (!str_starts_with($realFile, $realDir . DIRECTORY_SEPARATOR)) return null;
+  return $realFile;
+}
+
+function isSafeLoopbackUrl(string $url): bool {
+  $parts = parse_url($url);
+  if ($parts === false) return false;
+  $scheme = $parts['scheme'] ?? '';
+  $host = $parts['host'] ?? '';
+  if ($scheme !== 'http' && $scheme !== 'https') return false;
+  if ($host === '127.0.0.1' || $host === 'localhost' || $host === '::1' || $host === '[::1]') return true;
+  return false;
+}
+
+function runCommand(string $cmd, int $timeoutSec, int $maxOut): array {
+  // Use proc_open so we can enforce timeout and capture stderr.
+  $descriptorspec = [
+    0 => ['pipe', 'r'],
+    1 => ['pipe', 'w'],
+    2 => ['pipe', 'w'],
+  ];
+  $process = proc_open($cmd, $descriptorspec, $pipes);
+  if (!is_resource($process)) {
+    return ['ok' => false, 'stdout' => '', 'stderr' => 'Failed to start process'];
+  }
+
+  fclose($pipes[0]);
+  stream_set_blocking($pipes[1], false);
+  stream_set_blocking($pipes[2], false);
+
+  $stdout = '';
+  $stderr = '';
+  $start = microtime(true);
+
+  while (true) {
+    $status = proc_get_status($process);
+    $stdout .= stream_get_contents($pipes[1]) ?: '';
+    $stderr .= stream_get_contents($pipes[2]) ?: '';
+
+    if (strlen($stdout) > $maxOut * 2 || strlen($stderr) > $maxOut * 2) {
+      proc_terminate($process, 9);
+      break;
+    }
+
+    if (!$status['running']) break;
+
+    if ((microtime(true) - $start) > $timeoutSec) {
+      proc_terminate($process, 9);
+      $stderr .= "\n[timeout] exceeded {$timeoutSec}s";
+      break;
+    }
+    usleep(50_000);
+  }
+
+  $stdout .= stream_get_contents($pipes[1]) ?: '';
+  $stderr .= stream_get_contents($pipes[2]) ?: '';
+
+  fclose($pipes[1]);
+  fclose($pipes[2]);
+
+  $exitCode = proc_close($process);
+
+  $ok = ($exitCode === 0);
+  return ['ok' => $ok, 'stdout' => $stdout, 'stderr' => $stderr, 'exitCode' => $exitCode];
+}
+
+// ---- Main ----
+
+loadEnvFile(ENV_FILE);
+
+$raw = stream_get_contents(STDIN);
+if ($raw === false || trim($raw) === '') {
+  respond(false, "No input received. Expected JSON on STDIN.");
+}
+
+$data = json_decode($raw, true);
+if (!is_array($data)) {
+  respond(false, "Invalid JSON input.");
+}
+
+$action = $data['action'] ?? null;
+$params = $data['params'] ?? [];
+if (!is_string($action) || $action === '') {
+  respond(false, "Missing action.");
+}
+if (!is_array($params)) $params = [];
+
+$maxOutput = (int)(getEnv('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
+if ($maxOutput < 10000) $maxOutput = 10000;
+
+$timeoutSec = (int)(getEnv('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
+if ($timeoutSec < 5) $timeoutSec = 5;
+if ($timeoutSec > 120) $timeoutSec = 120;
+
+$appDir = requireEnv('LARAVEL_DIAG_APP_DIR');
+if (!is_dir($appDir)) respond(false, "Invalid app dir: {$appDir}");
+
+$logDir = getEnv('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
+$healthUrl = getEnv('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
+$phpBin = getEnv('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
+$artisan = getEnv('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
+
+$enableMutations = strtolower(getEnv('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
+$enableMutations = in_array($enableMutations, ['1','true','yes','on'], true);
+
+$meta = [
+  'action' => $action,
+  'host' => php_uname('n'),
+];
+
+$out = '';
+$ok = true;
+
+switch ($action) {
+  case 'health': {
+    $url = $params['url'] ?? $healthUrl;
+    if (!is_string($url) || !isSafeLoopbackUrl($url)) {
+      respond(false, "Refused: health url must be loopback (127.0.0.1/localhost/::1).", $meta);
+    }
+    // Prefer curl if available.
+    $cmd = "command -v curl >/dev/null 2>&1 && curl -fsS -o /dev/null -m 10 -w '%{http_code}' " . escapeshellarg($url);
+    $res = runCommand("sh -lc " . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+    $code = trim(($res['stdout'] ?? '') . '');
+    if ($res['ok'] && $code === '200') {
+      $out = "OK (HTTP 200) - {$url}";
+      $ok = true;
+    } else {
+      $out = "FAIL (HTTP {$code}) - {$url}\n" . trim((string)($res['stderr'] ?? ''));
+      $ok = false;
+    }
+    break;
+  }
+
+  case 'sys.info': {
+    $cmd = "sh -lc " . escapeshellarg("uname -a; echo; date -Is; echo; uptime; echo; whoami");
+    $res = runCommand($cmd, $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'sys.disk': {
+    $res = runCommand("sh -lc " . escapeshellarg("df -h"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'sys.memory': {
+    $cmd = "sh -lc " . escapeshellarg("command -v free >/dev/null 2>&1 && free -m || (cat /proc/meminfo 2>/dev/null | head -n 30) || echo 'free and /proc/meminfo unavailable'");
+    $res = runCommand($cmd, $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'sys.top': {
+    $cmd = "sh -lc " . escapeshellarg("ps aux --sort=-%cpu | head -n 20; echo; ps aux --sort=-%mem | head -n 20");
+    $res = runCommand($cmd, $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'php.version': {
+    $res = runCommand("sh -lc " . escapeshellarg($phpBin . " -v"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'php.extensions': {
+    $res = runCommand("sh -lc " . escapeshellarg($phpBin . " -m"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'cache.status': {
+    $cacheDir = $appDir . '/bootstrap/cache';
+    if (!is_dir($cacheDir)) {
+      $out = "No bootstrap/cache directory found.";
+      $ok = true;
+      break;
+    }
+    $files = glob($cacheDir . '/*.php') ?: [];
+    usort($files, function($a, $b) {
+      return (filemtime($b) ?: 0) <=> (filemtime($a) ?: 0);
+    });
+
+    $lines = [];
+    $lines[] = "bootstrap/cache:";
+    foreach ($files as $f) {
+      $bn = basename($f);
+      $size = filesize($f);
+      $mtime = filemtime($f);
+      $lines[] = sprintf("- %s  (%s bytes, mtime: %s)", $bn, $size === false ? '?' : (string)$size, $mtime ? date('c', $mtime) : '?');
+    }
+    if (count($files) === 0) $lines[] = "- (no *.php cache artifacts)";
+    $out = implode("\n", $lines);
+    $ok = true;
+    break;
+  }
+
+  case 'logs.list': {
+    if (!is_dir($logDir)) respond(false, "Log dir not found: {$logDir}", $meta);
+    $files = glob($logDir . DIRECTORY_SEPARATOR . '*.log') ?: [];
+    usort($files, function($a, $b) {
+      return (filemtime($b) ?: 0) <=> (filemtime($a) ?: 0);
+    });
+
+    $lines = [];
+    $lines[] = "Logs in: {$logDir}";
+    $limit = 30;
+    $i = 0;
+    foreach ($files as $f) {
+      if (!is_file($f)) continue;
+      $bn = basename($f);
+      $size = filesize($f);
+      $mtime = filemtime($f);
+      $lines[] = sprintf("- %s  (%s bytes, mtime: %s)", $bn, $size === false ? '?' : (string)$size, $mtime ? date('c', $mtime) : '?');
+      $i++;
+      if ($i >= $limit) break;
+    }
+    if ($i === 0) $lines[] = "- (no *.log files found)";
+    $out = implode("\n", $lines);
+    $ok = true;
+    break;
+  }
+
+  case 'logs.tail': {
+    $file = $params['file'] ?? null;
+    $lines = $params['lines'] ?? 200;
+    if (!is_int($lines)) $lines = (int)$lines;
+    if ($lines < 10 || $lines > 2000) respond(false, "Invalid lines: {$lines}", $meta);
+
+    if ($file !== null && !is_string($file)) respond(false, "Invalid file param.", $meta);
+    if (!isSafeBasename($file)) respond(false, "Invalid file basename.", $meta);
+
+    $path = resolveLogFile($logDir, $file);
+    if ($path === null) respond(false, "Log file not found (or refused). Use logs.list to see available files.", $meta);
+
+    $cmd = "tail -n " . (int)$lines . " " . escapeshellarg($path);
+    $res = runCommand("sh -lc " . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'logs.grep': {
+    $file = $params['file'] ?? null;
+    $query = $params['query'] ?? '';
+    $maxMatches = $params['maxMatches'] ?? 200;
+    $ignoreCase = $params['ignoreCase'] ?? false;
+
+    if (!is_string($query) || trim($query) === '' || strlen($query) > 120) respond(false, "Invalid query.", $meta);
+    if (!is_int($maxMatches)) $maxMatches = (int)$maxMatches;
+    if ($maxMatches < 10 || $maxMatches > 500) respond(false, "Invalid maxMatches.", $meta);
+    if (!is_bool($ignoreCase)) $ignoreCase = (bool)$ignoreCase;
+
+    if ($file !== null && !is_string($file)) respond(false, "Invalid file param.", $meta);
+    if (!isSafeBasename($file)) respond(false, "Invalid file basename.", $meta);
+
+    $path = resolveLogFile($logDir, $file);
+    if ($path === null) respond(false, "Log file not found (or refused). Use logs.list to see available files.", $meta);
+
+    $grepFlags = "-nF";
+    if ($ignoreCase) $grepFlags .= "i";
+    // Use fixed string match (-F). Pipe into tail to cap output.
+    $cmd = "grep {$grepFlags} -- " . escapeshellarg($query) . " " . escapeshellarg($path) . " | tail -n " . (int)$maxMatches;
+    $res = runCommand("sh -lc " . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+
+    // grep returns exit code 1 when no matches. Treat that as ok.
+    $exitCode = $res['exitCode'] ?? 0;
+    $stdout = (string)($res['stdout'] ?? '');
+    $stderr = (string)($res['stderr'] ?? '');
+    if ($exitCode === 1 && trim($stdout) === '') {
+      $out = "(no matches)\n";
+      $ok = true;
+    } else {
+      $out = trim($stdout . "\n" . $stderr);
+      $ok = ($exitCode === 0);
+    }
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'logs.last_error': {
+    $file = $params['file'] ?? null;
+    $lines = $params['lines'] ?? 800;
+    if (!is_int($lines)) $lines = (int)$lines;
+    if ($lines < 50 || $lines > 5000) respond(false, "Invalid lines.", $meta);
+
+    if ($file !== null && !is_string($file)) respond(false, "Invalid file param.", $meta);
+    if (!isSafeBasename($file)) respond(false, "Invalid file basename.", $meta);
+
+    $path = resolveLogFile($logDir, $file);
+    if ($path === null) respond(false, "Log file not found (or refused). Use logs.list to see available files.", $meta);
+
+    // Tail a chunk and filter for common error markers.
+    $cmd = "tail -n " . (int)$lines . " " . escapeshellarg($path) . " | grep -nE -- 'ERROR|CRITICAL|EMERGENCY|Exception|Stack trace|SQLSTATE' | tail -n 200";
+    $res = runCommand("sh -lc " . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+
+    $exitCode = $res['exitCode'] ?? 0;
+    $stdout = (string)($res['stdout'] ?? '');
+    $stderr = (string)($res['stderr'] ?? '');
+
+    if ($exitCode === 1 && trim($stdout) === '') {
+      $out = "(no obvious error markers found in last {$lines} lines)\n";
+      $ok = true;
+    } else {
+      $out = trim($stdout . "\n" . $stderr);
+      $ok = ($exitCode === 0);
+    }
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  // ---- Artisan (fixed, allowlisted) ----
+  case 'artisan.version': {
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " --version --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.about': {
+    // about is designed to be safe summary info. Still redact as defense-in-depth.
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " about --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.migrate_status': {
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " migrate:status --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.schedule_list': {
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " schedule:list --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.queue_failed': {
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " queue:failed --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    // queue:failed returns 0 even if empty
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.horizon_status': {
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " horizon:status --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.queue_restart': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " queue:restart --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.pulse_restart': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " pulse:restart --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  default:
+    respond(false, "Unknown or disabled action: {$action}", $meta);
+}
+
+$out = redact($out);
+$out = truncate($out, $maxOutput);
+
+respond($ok, $out, $meta);
