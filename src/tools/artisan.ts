@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { SshConfig } from "../lib/ssh.js";
 import { asTextResult, runDiag } from "./util.js";
@@ -46,6 +47,40 @@ export function registerArtisanTools(
   // ---- Mutations (disabled by default; "break-glass") ----
 
   server.registerTool(
+    "artisan_optimize_clear",
+    {
+      description:
+        "BREAK-GLASS: Run `php artisan optimize:clear` (clears config, route, view, event, and app caches). Disabled unless LARAVEL_PROD_ENABLE_MUTATIONS=1.",
+      inputSchema: {},
+    },
+    async () => {
+      if (!policy.enableMutations) {
+        return asTextResult(
+          "Refused: mutations are disabled. Set LARAVEL_PROD_ENABLE_MUTATIONS=1 on the MCP server *and* allow this tool in Codex enabled_tools.",
+        );
+      }
+      return asTextResult((await runDiag(ssh, "artisan.optimize_clear")).output);
+    },
+  );
+
+  server.registerTool(
+    "artisan_config_cache",
+    {
+      description:
+        "BREAK-GLASS: Run `php artisan config:cache` (rebuilds cached config). Disabled unless LARAVEL_PROD_ENABLE_MUTATIONS=1.",
+      inputSchema: {},
+    },
+    async () => {
+      if (!policy.enableMutations) {
+        return asTextResult(
+          "Refused: mutations are disabled. Set LARAVEL_PROD_ENABLE_MUTATIONS=1 on the MCP server *and* allow this tool in Codex enabled_tools.",
+        );
+      }
+      return asTextResult((await runDiag(ssh, "artisan.config_cache")).output);
+    },
+  );
+
+  server.registerTool(
     "artisan_queue_restart",
     {
       description:
@@ -59,6 +94,25 @@ export function registerArtisanTools(
         );
       }
       return asTextResult((await runDiag(ssh, "artisan.queue_restart")).output);
+    },
+  );
+
+  server.registerTool(
+    "artisan_queue_retry",
+    {
+      description:
+        "BREAK-GLASS: Run `php artisan queue:retry <ids|all>`. Pass `targets` as `all` (default) or a list of failed job IDs separated by spaces/commas. Disabled unless LARAVEL_PROD_ENABLE_MUTATIONS=1.",
+      inputSchema: {
+        targets: z.string().min(1).max(500).default("all"),
+      },
+    },
+    async ({ targets }) => {
+      if (!policy.enableMutations) {
+        return asTextResult(
+          "Refused: mutations are disabled. Set LARAVEL_PROD_ENABLE_MUTATIONS=1 on the MCP server *and* allow this tool in Codex enabled_tools.",
+        );
+      }
+      return asTextResult((await runDiag(ssh, "artisan.queue_retry", { targets })).output);
     },
   );
 

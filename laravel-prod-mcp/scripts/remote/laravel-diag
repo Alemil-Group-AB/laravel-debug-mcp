@@ -15,7 +15,7 @@ declare(strict_types=1);
  * - Only allowlisted actions are supported.
  * - Inputs are validated (length, charset, basenames only).
  * - Health URL is restricted to loopback (prevents SSRF / internal scanning).
- * - No direct reading of .env or other sensitive config files.
+ * - File reads are restricted to files that resolve under app root.
  */
 
 ini_set('display_errors', '0');
@@ -55,14 +55,14 @@ function loadEnvFile(string $path): void {
   }
 }
 
-function getEnv(string $key, ?string $default = null): ?string {
+function envValue(string $key, ?string $default = null): ?string {
   $v = getenv($key);
   if ($v === false || $v === '') return $default;
   return $v;
 }
 
 function requireEnv(string $key): string {
-  $v = getEnv($key);
+  $v = envValue($key);
   if ($v === null) respond(false, "Missing required config: {$key}");
   return $v;
 }
@@ -146,6 +146,67 @@ function resolveLogFile(string $logDir, ?string $basename): ?string {
   return $realFile;
 }
 
+function resolveEnvFile(string $appDir, ?string $basename): ?string {
+  $target = $basename ?? '.env';
+  if (!isSafeBasename($target)) return null;
+  // Restrict to .env variants only, e.g. .env, .env.production
+  if (!preg_match('/^\.env([A-Za-z0-9._-]*)$/', $target)) return null;
+
+  $path = $appDir . DIRECTORY_SEPARATOR . $target;
+  if (!is_file($path)) return null;
+
+  $realDir = realpath($appDir);
+  $realFile = realpath($path);
+  if ($realDir === false || $realFile === false) return null;
+  if ($realFile !== $realDir . DIRECTORY_SEPARATOR . $target) return null;
+  if (!str_starts_with($realFile, $realDir . DIRECTORY_SEPARATOR)) return null;
+
+  return $realFile;
+}
+
+function normalizeProjectRelativePath(string $relativePath): ?string {
+  if ($relativePath === '' || strlen($relativePath) > 512) return null;
+  if (str_contains($relativePath, "\0")) return null;
+
+  $rel = trim(str_replace('\\', '/', $relativePath));
+  if ($rel === '') return null;
+  $rel = ltrim($rel, '/');
+  if ($rel === '') $rel = '.';
+
+  return $rel;
+}
+
+function resolveProjectPath(string $appDir, string $relativePath): ?string {
+  $base = realpath($appDir);
+  if ($base === false || !is_dir($base)) return null;
+
+  $rel = normalizeProjectRelativePath($relativePath);
+  if ($rel === null) return null;
+
+  $candidate = ($rel === '.') ? $base : ($base . DIRECTORY_SEPARATOR . $rel);
+  $resolved = realpath($candidate);
+  if ($resolved === false) return null;
+
+  if ($resolved !== $base && !str_starts_with($resolved, $base . DIRECTORY_SEPARATOR)) return null;
+  return $resolved;
+}
+
+function projectRelativePath(string $appDir, string $absolutePath): ?string {
+  $base = realpath($appDir);
+  if ($base === false) return null;
+
+  if ($absolutePath === $base) return '.';
+  if (!str_starts_with($absolutePath, $base . DIRECTORY_SEPARATOR)) return null;
+
+  return str_replace('\\', '/', substr($absolutePath, strlen($base) + 1));
+}
+
+function resolveProjectFile(string $appDir, string $relativePath): ?string {
+  $resolved = resolveProjectPath($appDir, $relativePath);
+  if ($resolved === null || !is_file($resolved)) return null;
+  return $resolved;
+}
+
 function isSafeLoopbackUrl(string $url): bool {
   $parts = parse_url($url);
   if ($parts === false) return false;
@@ -222,29 +283,37 @@ if (!is_array($data)) {
   respond(false, "Invalid JSON input.");
 }
 
-$action = $data['action'] ?? null;
+$action = $data['action'] ?? ($data['cmd'] ?? null);
 $params = $data['params'] ?? [];
 if (!is_string($action) || $action === '') {
-  respond(false, "Missing action.");
+  respond(false, "Missing action/cmd.");
 }
 if (!is_array($params)) $params = [];
 
-$maxOutput = (int)(getEnv('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
+// Backward compatibility: accept MCP tool-style names like "sys_info".
+if (!str_contains($action, '.') && str_contains($action, '_')) {
+  $parts = explode('_', $action, 2);
+  if (count($parts) === 2 && $parts[0] !== '' && $parts[1] !== '') {
+    $action = $parts[0] . '.' . $parts[1];
+  }
+}
+
+$maxOutput = (int)(envValue('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
 if ($maxOutput < 10000) $maxOutput = 10000;
 
-$timeoutSec = (int)(getEnv('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
+$timeoutSec = (int)(envValue('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
 if ($timeoutSec < 5) $timeoutSec = 5;
 if ($timeoutSec > 120) $timeoutSec = 120;
 
 $appDir = requireEnv('LARAVEL_DIAG_APP_DIR');
 if (!is_dir($appDir)) respond(false, "Invalid app dir: {$appDir}");
 
-$logDir = getEnv('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
-$healthUrl = getEnv('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
-$phpBin = getEnv('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
-$artisan = getEnv('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
+$logDir = envValue('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
+$healthUrl = envValue('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
+$phpBin = envValue('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
+$artisan = envValue('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
 
-$enableMutations = strtolower(getEnv('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
+$enableMutations = strtolower(envValue('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
 $enableMutations = in_array($enableMutations, ['1','true','yes','on'], true);
 
 $meta = [
@@ -347,6 +416,137 @@ switch ($action) {
     if (count($files) === 0) $lines[] = "- (no *.php cache artifacts)";
     $out = implode("\n", $lines);
     $ok = true;
+    break;
+  }
+
+  case 'env.read': {
+    $file = $params['file'] ?? '.env';
+    if (!is_string($file) || trim($file) === '' || strlen($file) > 64) {
+      respond(false, "Invalid env file param.", $meta);
+    }
+
+    $path = resolveEnvFile($appDir, $file);
+    if ($path === null) {
+      respond(false, "Env file not found (or refused). Allowed names match `.env*` under app root.", $meta);
+    }
+
+    $content = file_get_contents($path);
+    if ($content === false) respond(false, "Failed to read env file.", $meta);
+
+    $out = $content;
+    $ok = true;
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'file.list': {
+    $path = $params['path'] ?? '.';
+    $recursive = $params['recursive'] ?? false;
+    $maxEntries = $params['maxEntries'] ?? 300;
+
+    if (!is_string($path) || trim($path) === '') respond(false, "Invalid path param.", $meta);
+    if (!is_bool($recursive)) $recursive = (bool)$recursive;
+    if (!is_int($maxEntries)) $maxEntries = (int)$maxEntries;
+    if ($maxEntries < 1 || $maxEntries > 1000) respond(false, "Invalid maxEntries.", $meta);
+
+    $resolved = resolveProjectPath($appDir, $path);
+    if ($resolved === null) {
+      respond(false, "Path not found (or refused). Path must resolve under app root.", $meta);
+    }
+
+    $base = realpath($appDir);
+    if ($base === false) respond(false, "Invalid app dir.", $meta);
+
+    $resolvedRel = projectRelativePath($appDir, $resolved) ?? '.';
+
+    $lines = [];
+    $lines[] = "Path: {$resolvedRel}";
+    $lines[] = "Type: " . (is_dir($resolved) ? "directory" : "file");
+
+    $count = 0;
+
+    if (is_file($resolved)) {
+      $size = filesize($resolved);
+      $mtime = filemtime($resolved);
+      $lines[] = sprintf(
+        "[F] %s (%s bytes, mtime: %s)",
+        $resolvedRel,
+        $size === false ? '?' : (string)$size,
+        $mtime ? date('c', $mtime) : '?'
+      );
+      $count = 1;
+    } elseif (is_dir($resolved)) {
+      if ($recursive) {
+        $dirIt = new RecursiveDirectoryIterator($resolved, FilesystemIterator::SKIP_DOTS);
+        $it = new RecursiveIteratorIterator($dirIt, RecursiveIteratorIterator::SELF_FIRST);
+
+        foreach ($it as $entry) {
+          $entryPath = $entry->getPathname();
+          $realEntry = realpath($entryPath);
+          if ($realEntry === false) continue;
+          if (!str_starts_with($realEntry, $base . DIRECTORY_SEPARATOR)) continue;
+
+          $rel = projectRelativePath($appDir, $realEntry);
+          if ($rel === null) continue;
+
+          $isDir = $entry->isDir();
+          $lines[] = ($isDir ? "[D] " : "[F] ") . $rel . ($isDir ? "/" : "");
+          $count++;
+          if ($count >= $maxEntries) break;
+        }
+      } else {
+        $children = scandir($resolved);
+        if ($children === false) $children = [];
+
+        foreach ($children as $name) {
+          if ($name === '.' || $name === '..') continue;
+          $realChild = realpath($resolved . DIRECTORY_SEPARATOR . $name);
+          if ($realChild === false) continue;
+          if (!str_starts_with($realChild, $base . DIRECTORY_SEPARATOR)) continue;
+
+          $rel = projectRelativePath($appDir, $realChild);
+          if ($rel === null) continue;
+
+          $isDir = is_dir($realChild);
+          $lines[] = ($isDir ? "[D] " : "[F] ") . $rel . ($isDir ? "/" : "");
+          $count++;
+          if ($count >= $maxEntries) break;
+        }
+      }
+    } else {
+      respond(false, "Path is not a regular file or directory.", $meta);
+    }
+
+    if ($count === 0 && is_dir($resolved)) {
+      $lines[] = "(empty directory)";
+    } elseif ($count >= $maxEntries) {
+      $lines[] = "...(truncated at {$maxEntries} entries)";
+    }
+
+    $out = implode("\n", $lines);
+    $ok = true;
+    $meta['path'] = $path;
+    $meta['resolved'] = $resolvedRel;
+    break;
+  }
+
+  case 'file.read': {
+    $path = $params['path'] ?? null;
+    if (!is_string($path) || trim($path) === '') {
+      respond(false, "Invalid path param.", $meta);
+    }
+
+    $resolved = resolveProjectFile($appDir, $path);
+    if ($resolved === null) {
+      respond(false, "File not found (or refused). Path must resolve under app root.", $meta);
+    }
+
+    $content = file_get_contents($resolved);
+    if ($content === false) respond(false, "Failed to read file.", $meta);
+
+    $out = $content;
+    $ok = true;
+    $meta['file'] = $path;
     break;
   }
 
@@ -513,6 +713,61 @@ switch ($action) {
   case 'artisan.queue_restart': {
     if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
     $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " queue:restart --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.optimize_clear': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " optimize:clear --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.config_cache': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " config:cache --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.queue_retry': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+
+    $targets = $params['targets'] ?? 'all';
+    if (!is_string($targets) || trim($targets) === '' || strlen($targets) > 500) {
+      respond(false, "Invalid targets param.", $meta);
+    }
+
+    $rawTokens = preg_split('/[\s,]+/', trim($targets)) ?: [];
+    $tokens = array_values(array_filter($rawTokens, fn($v) => is_string($v) && $v !== ''));
+    if (count($tokens) === 0) respond(false, "Invalid targets param.", $meta);
+
+    $retryArgs = [];
+    $hasAll = false;
+    foreach ($tokens as $token) {
+      $t = strtolower($token);
+      if ($t === 'all') {
+        $hasAll = true;
+        continue;
+      }
+      if (!preg_match('/^\d+$/', $token)) {
+        respond(false, "Invalid queue retry target: {$token}", $meta);
+      }
+      $retryArgs[] = $token;
+    }
+
+    if ($hasAll && count($retryArgs) > 0) {
+      respond(false, "Invalid targets: use either `all` or numeric IDs.", $meta);
+    }
+    if ($hasAll) $retryArgs = ['all'];
+
+    $safeArgs = array_map(fn($id) => escapeshellarg((string)$id), $retryArgs);
+    $argStr = implode(' ', $safeArgs);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " queue:retry " . $argStr . " --no-ansi"), $timeoutSec, $maxOutput);
     $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
     $ok = (bool)($res['ok'] ?? false);
     break;
