@@ -55,14 +55,14 @@ function loadEnvFile(string $path): void {
   }
 }
 
-function getEnv(string $key, ?string $default = null): ?string {
+function envValue(string $key, ?string $default = null): ?string {
   $v = getenv($key);
   if ($v === false || $v === '') return $default;
   return $v;
 }
 
 function requireEnv(string $key): string {
-  $v = getEnv($key);
+  $v = envValue($key);
   if ($v === null) respond(false, "Missing required config: {$key}");
   return $v;
 }
@@ -222,29 +222,37 @@ if (!is_array($data)) {
   respond(false, "Invalid JSON input.");
 }
 
-$action = $data['action'] ?? null;
+$action = $data['action'] ?? ($data['cmd'] ?? null);
 $params = $data['params'] ?? [];
 if (!is_string($action) || $action === '') {
-  respond(false, "Missing action.");
+  respond(false, "Missing action/cmd.");
 }
 if (!is_array($params)) $params = [];
 
-$maxOutput = (int)(getEnv('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
+// Backward compatibility: accept MCP tool-style names like "sys_info".
+if (!str_contains($action, '.') && str_contains($action, '_')) {
+  $parts = explode('_', $action, 2);
+  if (count($parts) === 2 && $parts[0] !== '' && $parts[1] !== '') {
+    $action = $parts[0] . '.' . $parts[1];
+  }
+}
+
+$maxOutput = (int)(envValue('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
 if ($maxOutput < 10000) $maxOutput = 10000;
 
-$timeoutSec = (int)(getEnv('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
+$timeoutSec = (int)(envValue('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
 if ($timeoutSec < 5) $timeoutSec = 5;
 if ($timeoutSec > 120) $timeoutSec = 120;
 
 $appDir = requireEnv('LARAVEL_DIAG_APP_DIR');
 if (!is_dir($appDir)) respond(false, "Invalid app dir: {$appDir}");
 
-$logDir = getEnv('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
-$healthUrl = getEnv('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
-$phpBin = getEnv('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
-$artisan = getEnv('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
+$logDir = envValue('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
+$healthUrl = envValue('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
+$phpBin = envValue('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
+$artisan = envValue('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
 
-$enableMutations = strtolower(getEnv('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
+$enableMutations = strtolower(envValue('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
 $enableMutations = in_array($enableMutations, ['1','true','yes','on'], true);
 
 $meta = [
