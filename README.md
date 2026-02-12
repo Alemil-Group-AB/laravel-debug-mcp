@@ -21,6 +21,9 @@ A **production-safe MCP server** (STDIO) that lets **Codex CLI** run *common, re
 - `artisan_schedule_list` — `php artisan schedule:list`
 - `artisan_queue_failed` — `php artisan queue:failed`
 - `artisan_horizon_status` — `php artisan horizon:status` (if installed)
+- `file_list` — lists files/directories under app root (optionally recursive)
+- `file_read` — reads any file under app root by relative path
+- `env_read` — reads Laravel `.env*` file from app root (best-effort redacted)
 
 ### Logs
 - `logs_list` — lists log files in `storage/logs`
@@ -39,8 +42,16 @@ A **production-safe MCP server** (STDIO) that lets **Codex CLI** run *common, re
 ### Laravel cache artifacts (safe)
 - `cache_status` — lists `bootstrap/cache/*.php` files with mtime + size
 
+### Database (read-only)
+- `database_connections` — lists configured Laravel DB connections and default
+- `database_schema` — inspects tables/columns/indexes/foreign keys (with optional filter)
+- `database_query` — executes read-only SQL (`SELECT/SHOW/EXPLAIN/DESCRIBE`) with row caps
+
 ### Break-glass mutations (disabled by default)
+- `artisan_optimize_clear` — `php artisan optimize:clear`
+- `artisan_config_cache` — `php artisan config:cache`
 - `artisan_queue_restart` — `php artisan queue:restart`
+- `artisan_queue_retry` — `php artisan queue:retry <ids|all>`
 - `artisan_pulse_restart` — `php artisan pulse:restart` (if installed)
 
 Both are **double-gated**:
@@ -221,6 +232,12 @@ enabled_tools = [
   "php_version",
   "php_extensions",
   "cache_status",
+  "file_list",
+  "file_read",
+  "env_read",
+  "database_connections",
+  "database_schema",
+  "database_query",
   "artisan_version",
   "artisan_about",
   "artisan_migrate_status",
@@ -256,6 +273,12 @@ enabled_tools = [
   "php_version",
   "php_extensions",
   "cache_status",
+  "file_list",
+  "file_read",
+  "env_read",
+  "database_connections",
+  "database_schema",
+  "database_query",
   "artisan_version",
   "artisan_about",
   "artisan_migrate_status",
@@ -330,7 +353,8 @@ If you use forced-command, running `ssh codexdiag@prod.example.com` will wait fo
 - Use **forced-command** in `authorized_keys`
 - Keep this toolset **read-only**; enable mutations only for break-glass situations
 - Redact secrets; still treat outputs as sensitive
-- Do not allow reading `.env` or arbitrary files
+- File reads are restricted to files that resolve under app root (`LARAVEL_DIAG_APP_DIR`)
+- SQL execution is restricted to read-only allowlisted statements
 
 ---
 

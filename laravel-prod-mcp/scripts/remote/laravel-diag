@@ -15,7 +15,8 @@ declare(strict_types=1);
  * - Only allowlisted actions are supported.
  * - Inputs are validated (length, charset, basenames only).
  * - Health URL is restricted to loopback (prevents SSRF / internal scanning).
- * - No direct reading of .env or other sensitive config files.
+ * - File reads are restricted to files that resolve under app root.
+ * - SQL execution is read-only and allowlisted (SELECT/SHOW/EXPLAIN/DESCRIBE only).
  */
 
 ini_set('display_errors', '0');
@@ -55,14 +56,14 @@ function loadEnvFile(string $path): void {
   }
 }
 
-function getEnv(string $key, ?string $default = null): ?string {
+function envValue(string $key, ?string $default = null): ?string {
   $v = getenv($key);
   if ($v === false || $v === '') return $default;
   return $v;
 }
 
 function requireEnv(string $key): string {
-  $v = getEnv($key);
+  $v = envValue($key);
   if ($v === null) respond(false, "Missing required config: {$key}");
   return $v;
 }
@@ -146,6 +147,175 @@ function resolveLogFile(string $logDir, ?string $basename): ?string {
   return $realFile;
 }
 
+function resolveEnvFile(string $appDir, ?string $basename): ?string {
+  $target = $basename ?? '.env';
+  if (!isSafeBasename($target)) return null;
+  // Restrict to .env variants only, e.g. .env, .env.production
+  if (!preg_match('/^\.env([A-Za-z0-9._-]*)$/', $target)) return null;
+
+  $path = $appDir . DIRECTORY_SEPARATOR . $target;
+  if (!is_file($path)) return null;
+
+  $realDir = realpath($appDir);
+  $realFile = realpath($path);
+  if ($realDir === false || $realFile === false) return null;
+  if ($realFile !== $realDir . DIRECTORY_SEPARATOR . $target) return null;
+  if (!str_starts_with($realFile, $realDir . DIRECTORY_SEPARATOR)) return null;
+
+  return $realFile;
+}
+
+function normalizeProjectRelativePath(string $relativePath): ?string {
+  if ($relativePath === '' || strlen($relativePath) > 512) return null;
+  if (str_contains($relativePath, "\0")) return null;
+
+  $rel = trim(str_replace('\\', '/', $relativePath));
+  if ($rel === '') return null;
+  $rel = ltrim($rel, '/');
+  if ($rel === '') $rel = '.';
+
+  return $rel;
+}
+
+function resolveProjectPath(string $appDir, string $relativePath): ?string {
+  $base = realpath($appDir);
+  if ($base === false || !is_dir($base)) return null;
+
+  $rel = normalizeProjectRelativePath($relativePath);
+  if ($rel === null) return null;
+
+  $candidate = ($rel === '.') ? $base : ($base . DIRECTORY_SEPARATOR . $rel);
+  $resolved = realpath($candidate);
+  if ($resolved === false) return null;
+
+  if ($resolved !== $base && !str_starts_with($resolved, $base . DIRECTORY_SEPARATOR)) return null;
+  return $resolved;
+}
+
+function projectRelativePath(string $appDir, string $absolutePath): ?string {
+  $base = realpath($appDir);
+  if ($base === false) return null;
+
+  if ($absolutePath === $base) return '.';
+  if (!str_starts_with($absolutePath, $base . DIRECTORY_SEPARATOR)) return null;
+
+  return str_replace('\\', '/', substr($absolutePath, strlen($base) + 1));
+}
+
+function resolveProjectFile(string $appDir, string $relativePath): ?string {
+  $resolved = resolveProjectPath($appDir, $relativePath);
+  if ($resolved === null || !is_file($resolved)) return null;
+  return $resolved;
+}
+
+function isSafeConnectionName(?string $name): bool {
+  if ($name === null) return true;
+  if ($name === '' || strlen($name) > 64) return false;
+  return (bool)preg_match('/^[A-Za-z0-9._-]+$/', $name);
+}
+
+function normalizeReadOnlySql(string $query): ?string {
+  if (str_contains($query, "\0")) return null;
+
+  $trimmed = trim($query);
+  if ($trimmed === '' || strlen($trimmed) > 5000) return null;
+
+  // Allow at most one trailing ';' and reject multi-statement input.
+  $withoutTrailing = rtrim($trimmed);
+  if (str_ends_with($withoutTrailing, ';')) {
+    $withoutTrailing = rtrim(substr($withoutTrailing, 0, -1));
+  }
+  if ($withoutTrailing === '' || str_contains($withoutTrailing, ';')) return null;
+
+  if (!preg_match('/^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC)\b/i', $withoutTrailing)) return null;
+
+  // Defense-in-depth for read-only query edge cases.
+  if (preg_match('/^\s*SELECT\b/i', $withoutTrailing)) {
+    if (preg_match('/\bINTO\s+OUTFILE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bINTO\s+DUMPFILE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bFOR\s+UPDATE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bLOCK\s+IN\s+SHARE\s+MODE\b/i', $withoutTrailing)) return null;
+  }
+
+  return $withoutTrailing;
+}
+
+function detectTableName(mixed $row): ?string {
+  $data = is_array($row) ? $row : (is_object($row) ? get_object_vars($row) : []);
+  if (!is_array($data)) return null;
+
+  foreach (['name', 'table_name', 'table', 'tablename'] as $key) {
+    $v = $data[$key] ?? null;
+    if (is_string($v) && $v !== '') return $v;
+  }
+
+  foreach ($data as $v) {
+    if (is_string($v) && $v !== '') return $v;
+  }
+
+  return null;
+}
+
+function normalizeRows(mixed $rows): array {
+  if (!is_array($rows)) return [];
+
+  $out = [];
+  foreach ($rows as $row) {
+    if (is_array($row)) {
+      $out[] = $row;
+      continue;
+    }
+    if (is_object($row)) {
+      $out[] = get_object_vars($row);
+      continue;
+    }
+    $out[] = ['value' => $row];
+  }
+
+  return $out;
+}
+
+function bootstrapLaravelDb(string $appDir): array {
+  static $cache = [];
+  if (isset($cache[$appDir])) return $cache[$appDir];
+
+  $autoload = $appDir . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+  $bootstrap = $appDir . DIRECTORY_SEPARATOR . 'bootstrap' . DIRECTORY_SEPARATOR . 'app.php';
+
+  if (!is_file($autoload)) {
+    return $cache[$appDir] = ['ok' => false, 'error' => "Missing autoload file: {$autoload}"];
+  }
+  if (!is_file($bootstrap)) {
+    return $cache[$appDir] = ['ok' => false, 'error' => "Missing bootstrap file: {$bootstrap}"];
+  }
+
+  try {
+    require_once $autoload;
+    $app = require $bootstrap;
+    if (!is_object($app) || !method_exists($app, 'make')) {
+      return $cache[$appDir] = ['ok' => false, 'error' => 'Failed to bootstrap Laravel application.'];
+    }
+
+    $kernel = $app->make('Illuminate\Contracts\Console\Kernel');
+    if (is_object($kernel) && method_exists($kernel, 'bootstrap')) {
+      $kernel->bootstrap();
+    }
+
+    $db = $app->make('db');
+    $config = $app->make('config');
+
+    return $cache[$appDir] = ['ok' => true, 'db' => $db, 'config' => $config];
+  } catch (Throwable $e) {
+    return $cache[$appDir] = ['ok' => false, 'error' => $e->getMessage()];
+  }
+}
+
+function encodeJsonPretty(array $payload): string {
+  $encoded = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+  if ($encoded === false) return "Failed to encode output as JSON.";
+  return $encoded;
+}
+
 function isSafeLoopbackUrl(string $url): bool {
   $parts = parse_url($url);
   if ($parts === false) return false;
@@ -222,29 +392,37 @@ if (!is_array($data)) {
   respond(false, "Invalid JSON input.");
 }
 
-$action = $data['action'] ?? null;
+$action = $data['action'] ?? ($data['cmd'] ?? null);
 $params = $data['params'] ?? [];
 if (!is_string($action) || $action === '') {
-  respond(false, "Missing action.");
+  respond(false, "Missing action/cmd.");
 }
 if (!is_array($params)) $params = [];
 
-$maxOutput = (int)(getEnv('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
+// Backward compatibility: accept MCP tool-style names like "sys_info".
+if (!str_contains($action, '.') && str_contains($action, '_')) {
+  $parts = explode('_', $action, 2);
+  if (count($parts) === 2 && $parts[0] !== '' && $parts[1] !== '') {
+    $action = $parts[0] . '.' . $parts[1];
+  }
+}
+
+$maxOutput = (int)(envValue('LARAVEL_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
 if ($maxOutput < 10000) $maxOutput = 10000;
 
-$timeoutSec = (int)(getEnv('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
+$timeoutSec = (int)(envValue('LARAVEL_DIAG_TIMEOUT_SEC', '25') ?? '25');
 if ($timeoutSec < 5) $timeoutSec = 5;
 if ($timeoutSec > 120) $timeoutSec = 120;
 
 $appDir = requireEnv('LARAVEL_DIAG_APP_DIR');
 if (!is_dir($appDir)) respond(false, "Invalid app dir: {$appDir}");
 
-$logDir = getEnv('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
-$healthUrl = getEnv('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
-$phpBin = getEnv('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
-$artisan = getEnv('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
+$logDir = envValue('LARAVEL_DIAG_LOG_DIR', $appDir . '/storage/logs') ?? ($appDir . '/storage/logs');
+$healthUrl = envValue('LARAVEL_DIAG_HEALTH_URL', 'http://127.0.0.1/up') ?? 'http://127.0.0.1/up';
+$phpBin = envValue('LARAVEL_DIAG_PHP_BIN', 'php') ?? 'php';
+$artisan = envValue('LARAVEL_DIAG_ARTISAN', $appDir . '/artisan') ?? ($appDir . '/artisan');
 
-$enableMutations = strtolower(getEnv('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
+$enableMutations = strtolower(envValue('LARAVEL_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
 $enableMutations = in_array($enableMutations, ['1','true','yes','on'], true);
 
 $meta = [
@@ -347,6 +525,318 @@ switch ($action) {
     if (count($files) === 0) $lines[] = "- (no *.php cache artifacts)";
     $out = implode("\n", $lines);
     $ok = true;
+    break;
+  }
+
+  case 'database.connections': {
+    $boot = bootstrapLaravelDb($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, "Failed to bootstrap Laravel for database access: " . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $config = $boot['config'] ?? null;
+    if (!is_object($config) || !method_exists($config, 'get')) {
+      respond(false, "Laravel config service is not available.", $meta);
+    }
+
+    $defaultConnection = (string)($config->get('database.default') ?? '');
+    $rawConnections = $config->get('database.connections', []);
+    if (!is_array($rawConnections)) $rawConnections = [];
+
+    $connections = [];
+    foreach ($rawConnections as $name => $cfg) {
+      if (!is_string($name)) continue;
+      $driver = null;
+      if (is_array($cfg) && isset($cfg['driver']) && is_string($cfg['driver'])) {
+        $driver = $cfg['driver'];
+      }
+      $connections[] = [
+        'name' => $name,
+        'driver' => $driver,
+        'isDefault' => ($name === $defaultConnection),
+      ];
+    }
+    usort($connections, fn($a, $b) => strcmp((string)$a['name'], (string)$b['name']));
+
+    $out = encodeJsonPretty([
+      'default' => $defaultConnection,
+      'count' => count($connections),
+      'connections' => $connections,
+    ]);
+    $ok = true;
+    break;
+  }
+
+  case 'database.schema': {
+    $database = $params['database'] ?? null;
+    $filter = $params['filter'] ?? null;
+    $maxTables = $params['maxTables'] ?? 30;
+
+    if ($database !== null && !is_string($database)) respond(false, "Invalid database param.", $meta);
+    if (!isSafeConnectionName($database)) respond(false, "Invalid database connection name.", $meta);
+    if ($filter !== null && !is_string($filter)) respond(false, "Invalid filter param.", $meta);
+    if ($filter !== null && strlen($filter) > 120) respond(false, "Filter is too long.", $meta);
+    if (!is_int($maxTables)) $maxTables = (int)$maxTables;
+    if ($maxTables < 1 || $maxTables > 100) respond(false, "Invalid maxTables.", $meta);
+
+    $boot = bootstrapLaravelDb($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, "Failed to bootstrap Laravel for database access: " . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $config = $boot['config'] ?? null;
+    $db = $boot['db'] ?? null;
+    if (!is_object($config) || !method_exists($config, 'get')) respond(false, "Laravel config service is not available.", $meta);
+    if (!is_object($db) || !method_exists($db, 'connection')) respond(false, "Laravel database service is not available.", $meta);
+
+    $defaultConnection = (string)($config->get('database.default') ?? '');
+    $connectionName = ($database === null || trim($database) === '') ? $defaultConnection : $database;
+    if (!is_string($connectionName) || $connectionName === '') respond(false, "No database connection resolved.", $meta);
+
+    try {
+      $connection = $db->connection($connectionName);
+      $schema = $connection->getSchemaBuilder();
+      if (!is_object($schema) || !method_exists($schema, 'getTables')) {
+        respond(false, "Schema introspection is not supported by this Laravel/database driver.", $meta);
+      }
+
+      $driver = method_exists($connection, 'getDriverName') ? (string)$connection->getDriverName() : 'unknown';
+      $allTablesRaw = $schema->getTables();
+      if (!is_array($allTablesRaw)) $allTablesRaw = [];
+
+      $needle = ($filter !== null && trim($filter) !== '') ? mb_strtolower(trim($filter)) : null;
+
+      $matchedTables = [];
+      foreach ($allTablesRaw as $row) {
+        $tableName = detectTableName($row);
+        if ($tableName === null) continue;
+        if ($needle !== null && !str_contains(mb_strtolower($tableName), $needle)) continue;
+        $matchedTables[] = $tableName;
+      }
+
+      sort($matchedTables, SORT_NATURAL | SORT_FLAG_CASE);
+      $totalMatched = count($matchedTables);
+      $selectedTables = array_slice($matchedTables, 0, $maxTables);
+
+      $tables = [];
+      foreach ($selectedTables as $tableName) {
+        $columns = method_exists($schema, 'getColumns') ? normalizeRows($schema->getColumns($tableName)) : [];
+        $indexes = method_exists($schema, 'getIndexes') ? normalizeRows($schema->getIndexes($tableName)) : [];
+        $foreignKeys = method_exists($schema, 'getForeignKeys') ? normalizeRows($schema->getForeignKeys($tableName)) : [];
+
+        $tables[] = [
+          'name' => $tableName,
+          'columns' => $columns,
+          'indexes' => $indexes,
+          'foreignKeys' => $foreignKeys,
+        ];
+      }
+
+      $out = encodeJsonPretty([
+        'database' => $connectionName,
+        'driver' => $driver,
+        'filter' => $filter,
+        'totalMatchedTables' => $totalMatched,
+        'returnedTables' => count($tables),
+        'truncated' => ($totalMatched > count($tables)),
+        'tables' => $tables,
+      ]);
+      $ok = true;
+      $meta['database'] = $connectionName;
+      break;
+    } catch (Throwable $e) {
+      respond(false, "Database schema introspection failed: " . $e->getMessage(), $meta);
+    }
+  }
+
+  case 'database.query': {
+    $query = $params['query'] ?? null;
+    $database = $params['database'] ?? null;
+    $maxRows = $params['maxRows'] ?? 200;
+
+    if (!is_string($query) || trim($query) === '') respond(false, "Invalid query.", $meta);
+    if ($database !== null && !is_string($database)) respond(false, "Invalid database param.", $meta);
+    if (!isSafeConnectionName($database)) respond(false, "Invalid database connection name.", $meta);
+    if (!is_int($maxRows)) $maxRows = (int)$maxRows;
+    if ($maxRows < 1 || $maxRows > 1000) respond(false, "Invalid maxRows.", $meta);
+
+    $sql = normalizeReadOnlySql($query);
+    if ($sql === null) {
+      respond(false, "Only single-statement read-only SQL is allowed (SELECT/SHOW/EXPLAIN/DESCRIBE).", $meta);
+    }
+
+    $boot = bootstrapLaravelDb($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, "Failed to bootstrap Laravel for database access: " . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $config = $boot['config'] ?? null;
+    $db = $boot['db'] ?? null;
+    if (!is_object($config) || !method_exists($config, 'get')) respond(false, "Laravel config service is not available.", $meta);
+    if (!is_object($db) || !method_exists($db, 'connection')) respond(false, "Laravel database service is not available.", $meta);
+
+    $defaultConnection = (string)($config->get('database.default') ?? '');
+    $connectionName = ($database === null || trim($database) === '') ? $defaultConnection : $database;
+    if (!is_string($connectionName) || $connectionName === '') respond(false, "No database connection resolved.", $meta);
+
+    try {
+      $connection = $db->connection($connectionName);
+      $driver = method_exists($connection, 'getDriverName') ? (string)$connection->getDriverName() : 'unknown';
+      $rows = $connection->select($sql);
+      $rows = normalizeRows($rows);
+
+      $totalRows = count($rows);
+      $truncated = false;
+      if ($totalRows > $maxRows) {
+        $rows = array_slice($rows, 0, $maxRows);
+        $truncated = true;
+      }
+
+      $out = encodeJsonPretty([
+        'database' => $connectionName,
+        'driver' => $driver,
+        'query' => $sql,
+        'totalRows' => $totalRows,
+        'returnedRows' => count($rows),
+        'truncated' => $truncated,
+        'rows' => $rows,
+      ]);
+      $ok = true;
+      $meta['database'] = $connectionName;
+      break;
+    } catch (Throwable $e) {
+      respond(false, "Database query failed: " . $e->getMessage(), $meta);
+    }
+  }
+
+  case 'env.read': {
+    $file = $params['file'] ?? '.env';
+    if (!is_string($file) || trim($file) === '' || strlen($file) > 64) {
+      respond(false, "Invalid env file param.", $meta);
+    }
+
+    $path = resolveEnvFile($appDir, $file);
+    if ($path === null) {
+      respond(false, "Env file not found (or refused). Allowed names match `.env*` under app root.", $meta);
+    }
+
+    $content = file_get_contents($path);
+    if ($content === false) respond(false, "Failed to read env file.", $meta);
+
+    $out = $content;
+    $ok = true;
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'file.list': {
+    $path = $params['path'] ?? '.';
+    $recursive = $params['recursive'] ?? false;
+    $maxEntries = $params['maxEntries'] ?? 300;
+
+    if (!is_string($path) || trim($path) === '') respond(false, "Invalid path param.", $meta);
+    if (!is_bool($recursive)) $recursive = (bool)$recursive;
+    if (!is_int($maxEntries)) $maxEntries = (int)$maxEntries;
+    if ($maxEntries < 1 || $maxEntries > 1000) respond(false, "Invalid maxEntries.", $meta);
+
+    $resolved = resolveProjectPath($appDir, $path);
+    if ($resolved === null) {
+      respond(false, "Path not found (or refused). Path must resolve under app root.", $meta);
+    }
+
+    $base = realpath($appDir);
+    if ($base === false) respond(false, "Invalid app dir.", $meta);
+
+    $resolvedRel = projectRelativePath($appDir, $resolved) ?? '.';
+
+    $lines = [];
+    $lines[] = "Path: {$resolvedRel}";
+    $lines[] = "Type: " . (is_dir($resolved) ? "directory" : "file");
+
+    $count = 0;
+
+    if (is_file($resolved)) {
+      $size = filesize($resolved);
+      $mtime = filemtime($resolved);
+      $lines[] = sprintf(
+        "[F] %s (%s bytes, mtime: %s)",
+        $resolvedRel,
+        $size === false ? '?' : (string)$size,
+        $mtime ? date('c', $mtime) : '?'
+      );
+      $count = 1;
+    } elseif (is_dir($resolved)) {
+      if ($recursive) {
+        $dirIt = new RecursiveDirectoryIterator($resolved, FilesystemIterator::SKIP_DOTS);
+        $it = new RecursiveIteratorIterator($dirIt, RecursiveIteratorIterator::SELF_FIRST);
+
+        foreach ($it as $entry) {
+          $entryPath = $entry->getPathname();
+          $realEntry = realpath($entryPath);
+          if ($realEntry === false) continue;
+          if (!str_starts_with($realEntry, $base . DIRECTORY_SEPARATOR)) continue;
+
+          $rel = projectRelativePath($appDir, $realEntry);
+          if ($rel === null) continue;
+
+          $isDir = $entry->isDir();
+          $lines[] = ($isDir ? "[D] " : "[F] ") . $rel . ($isDir ? "/" : "");
+          $count++;
+          if ($count >= $maxEntries) break;
+        }
+      } else {
+        $children = scandir($resolved);
+        if ($children === false) $children = [];
+
+        foreach ($children as $name) {
+          if ($name === '.' || $name === '..') continue;
+          $realChild = realpath($resolved . DIRECTORY_SEPARATOR . $name);
+          if ($realChild === false) continue;
+          if (!str_starts_with($realChild, $base . DIRECTORY_SEPARATOR)) continue;
+
+          $rel = projectRelativePath($appDir, $realChild);
+          if ($rel === null) continue;
+
+          $isDir = is_dir($realChild);
+          $lines[] = ($isDir ? "[D] " : "[F] ") . $rel . ($isDir ? "/" : "");
+          $count++;
+          if ($count >= $maxEntries) break;
+        }
+      }
+    } else {
+      respond(false, "Path is not a regular file or directory.", $meta);
+    }
+
+    if ($count === 0 && is_dir($resolved)) {
+      $lines[] = "(empty directory)";
+    } elseif ($count >= $maxEntries) {
+      $lines[] = "...(truncated at {$maxEntries} entries)";
+    }
+
+    $out = implode("\n", $lines);
+    $ok = true;
+    $meta['path'] = $path;
+    $meta['resolved'] = $resolvedRel;
+    break;
+  }
+
+  case 'file.read': {
+    $path = $params['path'] ?? null;
+    if (!is_string($path) || trim($path) === '') {
+      respond(false, "Invalid path param.", $meta);
+    }
+
+    $resolved = resolveProjectFile($appDir, $path);
+    if ($resolved === null) {
+      respond(false, "File not found (or refused). Path must resolve under app root.", $meta);
+    }
+
+    $content = file_get_contents($resolved);
+    if ($content === false) respond(false, "Failed to read file.", $meta);
+
+    $out = $content;
+    $ok = true;
+    $meta['file'] = $path;
     break;
   }
 
@@ -513,6 +1003,61 @@ switch ($action) {
   case 'artisan.queue_restart': {
     if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
     $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " queue:restart --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.optimize_clear': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " optimize:clear --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.config_cache': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " config:cache --no-ansi"), $timeoutSec, $maxOutput);
+    $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'artisan.queue_retry': {
+    if (!$enableMutations) respond(false, "Refused: mutations disabled on remote. Set LARAVEL_DIAG_ENABLE_MUTATIONS=1.", $meta);
+
+    $targets = $params['targets'] ?? 'all';
+    if (!is_string($targets) || trim($targets) === '' || strlen($targets) > 500) {
+      respond(false, "Invalid targets param.", $meta);
+    }
+
+    $rawTokens = preg_split('/[\s,]+/', trim($targets)) ?: [];
+    $tokens = array_values(array_filter($rawTokens, fn($v) => is_string($v) && $v !== ''));
+    if (count($tokens) === 0) respond(false, "Invalid targets param.", $meta);
+
+    $retryArgs = [];
+    $hasAll = false;
+    foreach ($tokens as $token) {
+      $t = strtolower($token);
+      if ($t === 'all') {
+        $hasAll = true;
+        continue;
+      }
+      if (!preg_match('/^\d+$/', $token)) {
+        respond(false, "Invalid queue retry target: {$token}", $meta);
+      }
+      $retryArgs[] = $token;
+    }
+
+    if ($hasAll && count($retryArgs) > 0) {
+      respond(false, "Invalid targets: use either `all` or numeric IDs.", $meta);
+    }
+    if ($hasAll) $retryArgs = ['all'];
+
+    $safeArgs = array_map(fn($id) => escapeshellarg((string)$id), $retryArgs);
+    $argStr = implode(' ', $safeArgs);
+    $res = runCommand("sh -lc " . escapeshellarg("cd " . escapeshellarg($appDir) . " && " . escapeshellarg($phpBin) . " " . escapeshellarg($artisan) . " queue:retry " . $argStr . " --no-ansi"), $timeoutSec, $maxOutput);
     $out = trim(($res['stdout'] ?? '') . "\n" . ($res['stderr'] ?? ''));
     $ok = (bool)($res['ok'] ?? false);
     break;
