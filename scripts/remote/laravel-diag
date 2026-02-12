@@ -16,6 +16,7 @@ declare(strict_types=1);
  * - Inputs are validated (length, charset, basenames only).
  * - Health URL is restricted to loopback (prevents SSRF / internal scanning).
  * - File reads are restricted to files that resolve under app root.
+ * - SQL execution is read-only and allowlisted (SELECT/SHOW/EXPLAIN/DESCRIBE only).
  */
 
 ini_set('display_errors', '0');
@@ -205,6 +206,114 @@ function resolveProjectFile(string $appDir, string $relativePath): ?string {
   $resolved = resolveProjectPath($appDir, $relativePath);
   if ($resolved === null || !is_file($resolved)) return null;
   return $resolved;
+}
+
+function isSafeConnectionName(?string $name): bool {
+  if ($name === null) return true;
+  if ($name === '' || strlen($name) > 64) return false;
+  return (bool)preg_match('/^[A-Za-z0-9._-]+$/', $name);
+}
+
+function normalizeReadOnlySql(string $query): ?string {
+  if (str_contains($query, "\0")) return null;
+
+  $trimmed = trim($query);
+  if ($trimmed === '' || strlen($trimmed) > 5000) return null;
+
+  // Allow at most one trailing ';' and reject multi-statement input.
+  $withoutTrailing = rtrim($trimmed);
+  if (str_ends_with($withoutTrailing, ';')) {
+    $withoutTrailing = rtrim(substr($withoutTrailing, 0, -1));
+  }
+  if ($withoutTrailing === '' || str_contains($withoutTrailing, ';')) return null;
+
+  if (!preg_match('/^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC)\b/i', $withoutTrailing)) return null;
+
+  // Defense-in-depth for read-only query edge cases.
+  if (preg_match('/^\s*SELECT\b/i', $withoutTrailing)) {
+    if (preg_match('/\bINTO\s+OUTFILE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bINTO\s+DUMPFILE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bFOR\s+UPDATE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bLOCK\s+IN\s+SHARE\s+MODE\b/i', $withoutTrailing)) return null;
+  }
+
+  return $withoutTrailing;
+}
+
+function detectTableName(mixed $row): ?string {
+  $data = is_array($row) ? $row : (is_object($row) ? get_object_vars($row) : []);
+  if (!is_array($data)) return null;
+
+  foreach (['name', 'table_name', 'table', 'tablename'] as $key) {
+    $v = $data[$key] ?? null;
+    if (is_string($v) && $v !== '') return $v;
+  }
+
+  foreach ($data as $v) {
+    if (is_string($v) && $v !== '') return $v;
+  }
+
+  return null;
+}
+
+function normalizeRows(mixed $rows): array {
+  if (!is_array($rows)) return [];
+
+  $out = [];
+  foreach ($rows as $row) {
+    if (is_array($row)) {
+      $out[] = $row;
+      continue;
+    }
+    if (is_object($row)) {
+      $out[] = get_object_vars($row);
+      continue;
+    }
+    $out[] = ['value' => $row];
+  }
+
+  return $out;
+}
+
+function bootstrapLaravelDb(string $appDir): array {
+  static $cache = [];
+  if (isset($cache[$appDir])) return $cache[$appDir];
+
+  $autoload = $appDir . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+  $bootstrap = $appDir . DIRECTORY_SEPARATOR . 'bootstrap' . DIRECTORY_SEPARATOR . 'app.php';
+
+  if (!is_file($autoload)) {
+    return $cache[$appDir] = ['ok' => false, 'error' => "Missing autoload file: {$autoload}"];
+  }
+  if (!is_file($bootstrap)) {
+    return $cache[$appDir] = ['ok' => false, 'error' => "Missing bootstrap file: {$bootstrap}"];
+  }
+
+  try {
+    require_once $autoload;
+    $app = require $bootstrap;
+    if (!is_object($app) || !method_exists($app, 'make')) {
+      return $cache[$appDir] = ['ok' => false, 'error' => 'Failed to bootstrap Laravel application.'];
+    }
+
+    $kernel = $app->make('Illuminate\Contracts\Console\Kernel');
+    if (is_object($kernel) && method_exists($kernel, 'bootstrap')) {
+      $kernel->bootstrap();
+    }
+
+    $db = $app->make('db');
+    $config = $app->make('config');
+
+    return $cache[$appDir] = ['ok' => true, 'db' => $db, 'config' => $config];
+  } catch (Throwable $e) {
+    return $cache[$appDir] = ['ok' => false, 'error' => $e->getMessage()];
+  }
+}
+
+function encodeJsonPretty(array $payload): string {
+  $encoded = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+  if ($encoded === false) return "Failed to encode output as JSON.";
+  return $encoded;
 }
 
 function isSafeLoopbackUrl(string $url): bool {
@@ -417,6 +526,187 @@ switch ($action) {
     $out = implode("\n", $lines);
     $ok = true;
     break;
+  }
+
+  case 'database.connections': {
+    $boot = bootstrapLaravelDb($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, "Failed to bootstrap Laravel for database access: " . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $config = $boot['config'] ?? null;
+    if (!is_object($config) || !method_exists($config, 'get')) {
+      respond(false, "Laravel config service is not available.", $meta);
+    }
+
+    $defaultConnection = (string)($config->get('database.default') ?? '');
+    $rawConnections = $config->get('database.connections', []);
+    if (!is_array($rawConnections)) $rawConnections = [];
+
+    $connections = [];
+    foreach ($rawConnections as $name => $cfg) {
+      if (!is_string($name)) continue;
+      $driver = null;
+      if (is_array($cfg) && isset($cfg['driver']) && is_string($cfg['driver'])) {
+        $driver = $cfg['driver'];
+      }
+      $connections[] = [
+        'name' => $name,
+        'driver' => $driver,
+        'isDefault' => ($name === $defaultConnection),
+      ];
+    }
+    usort($connections, fn($a, $b) => strcmp((string)$a['name'], (string)$b['name']));
+
+    $out = encodeJsonPretty([
+      'default' => $defaultConnection,
+      'count' => count($connections),
+      'connections' => $connections,
+    ]);
+    $ok = true;
+    break;
+  }
+
+  case 'database.schema': {
+    $database = $params['database'] ?? null;
+    $filter = $params['filter'] ?? null;
+    $maxTables = $params['maxTables'] ?? 30;
+
+    if ($database !== null && !is_string($database)) respond(false, "Invalid database param.", $meta);
+    if (!isSafeConnectionName($database)) respond(false, "Invalid database connection name.", $meta);
+    if ($filter !== null && !is_string($filter)) respond(false, "Invalid filter param.", $meta);
+    if ($filter !== null && strlen($filter) > 120) respond(false, "Filter is too long.", $meta);
+    if (!is_int($maxTables)) $maxTables = (int)$maxTables;
+    if ($maxTables < 1 || $maxTables > 100) respond(false, "Invalid maxTables.", $meta);
+
+    $boot = bootstrapLaravelDb($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, "Failed to bootstrap Laravel for database access: " . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $config = $boot['config'] ?? null;
+    $db = $boot['db'] ?? null;
+    if (!is_object($config) || !method_exists($config, 'get')) respond(false, "Laravel config service is not available.", $meta);
+    if (!is_object($db) || !method_exists($db, 'connection')) respond(false, "Laravel database service is not available.", $meta);
+
+    $defaultConnection = (string)($config->get('database.default') ?? '');
+    $connectionName = ($database === null || trim($database) === '') ? $defaultConnection : $database;
+    if (!is_string($connectionName) || $connectionName === '') respond(false, "No database connection resolved.", $meta);
+
+    try {
+      $connection = $db->connection($connectionName);
+      $schema = $connection->getSchemaBuilder();
+      if (!is_object($schema) || !method_exists($schema, 'getTables')) {
+        respond(false, "Schema introspection is not supported by this Laravel/database driver.", $meta);
+      }
+
+      $driver = method_exists($connection, 'getDriverName') ? (string)$connection->getDriverName() : 'unknown';
+      $allTablesRaw = $schema->getTables();
+      if (!is_array($allTablesRaw)) $allTablesRaw = [];
+
+      $needle = ($filter !== null && trim($filter) !== '') ? mb_strtolower(trim($filter)) : null;
+
+      $matchedTables = [];
+      foreach ($allTablesRaw as $row) {
+        $tableName = detectTableName($row);
+        if ($tableName === null) continue;
+        if ($needle !== null && !str_contains(mb_strtolower($tableName), $needle)) continue;
+        $matchedTables[] = $tableName;
+      }
+
+      sort($matchedTables, SORT_NATURAL | SORT_FLAG_CASE);
+      $totalMatched = count($matchedTables);
+      $selectedTables = array_slice($matchedTables, 0, $maxTables);
+
+      $tables = [];
+      foreach ($selectedTables as $tableName) {
+        $columns = method_exists($schema, 'getColumns') ? normalizeRows($schema->getColumns($tableName)) : [];
+        $indexes = method_exists($schema, 'getIndexes') ? normalizeRows($schema->getIndexes($tableName)) : [];
+        $foreignKeys = method_exists($schema, 'getForeignKeys') ? normalizeRows($schema->getForeignKeys($tableName)) : [];
+
+        $tables[] = [
+          'name' => $tableName,
+          'columns' => $columns,
+          'indexes' => $indexes,
+          'foreignKeys' => $foreignKeys,
+        ];
+      }
+
+      $out = encodeJsonPretty([
+        'database' => $connectionName,
+        'driver' => $driver,
+        'filter' => $filter,
+        'totalMatchedTables' => $totalMatched,
+        'returnedTables' => count($tables),
+        'truncated' => ($totalMatched > count($tables)),
+        'tables' => $tables,
+      ]);
+      $ok = true;
+      $meta['database'] = $connectionName;
+      break;
+    } catch (Throwable $e) {
+      respond(false, "Database schema introspection failed: " . $e->getMessage(), $meta);
+    }
+  }
+
+  case 'database.query': {
+    $query = $params['query'] ?? null;
+    $database = $params['database'] ?? null;
+    $maxRows = $params['maxRows'] ?? 200;
+
+    if (!is_string($query) || trim($query) === '') respond(false, "Invalid query.", $meta);
+    if ($database !== null && !is_string($database)) respond(false, "Invalid database param.", $meta);
+    if (!isSafeConnectionName($database)) respond(false, "Invalid database connection name.", $meta);
+    if (!is_int($maxRows)) $maxRows = (int)$maxRows;
+    if ($maxRows < 1 || $maxRows > 1000) respond(false, "Invalid maxRows.", $meta);
+
+    $sql = normalizeReadOnlySql($query);
+    if ($sql === null) {
+      respond(false, "Only single-statement read-only SQL is allowed (SELECT/SHOW/EXPLAIN/DESCRIBE).", $meta);
+    }
+
+    $boot = bootstrapLaravelDb($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, "Failed to bootstrap Laravel for database access: " . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $config = $boot['config'] ?? null;
+    $db = $boot['db'] ?? null;
+    if (!is_object($config) || !method_exists($config, 'get')) respond(false, "Laravel config service is not available.", $meta);
+    if (!is_object($db) || !method_exists($db, 'connection')) respond(false, "Laravel database service is not available.", $meta);
+
+    $defaultConnection = (string)($config->get('database.default') ?? '');
+    $connectionName = ($database === null || trim($database) === '') ? $defaultConnection : $database;
+    if (!is_string($connectionName) || $connectionName === '') respond(false, "No database connection resolved.", $meta);
+
+    try {
+      $connection = $db->connection($connectionName);
+      $driver = method_exists($connection, 'getDriverName') ? (string)$connection->getDriverName() : 'unknown';
+      $rows = $connection->select($sql);
+      $rows = normalizeRows($rows);
+
+      $totalRows = count($rows);
+      $truncated = false;
+      if ($totalRows > $maxRows) {
+        $rows = array_slice($rows, 0, $maxRows);
+        $truncated = true;
+      }
+
+      $out = encodeJsonPretty([
+        'database' => $connectionName,
+        'driver' => $driver,
+        'query' => $sql,
+        'totalRows' => $totalRows,
+        'returnedRows' => count($rows),
+        'truncated' => $truncated,
+        'rows' => $rows,
+      ]);
+      $ok = true;
+      $meta['database'] = $connectionName;
+      break;
+    } catch (Throwable $e) {
+      respond(false, "Database query failed: " . $e->getMessage(), $meta);
+    }
   }
 
   case 'env.read': {

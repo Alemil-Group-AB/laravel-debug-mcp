@@ -42,6 +42,11 @@ A **production-safe MCP server** (STDIO) that lets **Codex CLI** run *common, re
 ### Laravel cache artifacts (safe)
 - `cache_status` — lists `bootstrap/cache/*.php` files with mtime + size
 
+### Database (read-only)
+- `database_connections` — lists configured Laravel DB connections and default
+- `database_schema` — inspects tables/columns/indexes/foreign keys (with optional filter)
+- `database_query` — executes read-only SQL (`SELECT/SHOW/EXPLAIN/DESCRIBE`) with row caps
+
 ### Break-glass mutations (disabled by default)
 - `artisan_optimize_clear` — `php artisan optimize:clear`
 - `artisan_config_cache` — `php artisan config:cache`
@@ -230,6 +235,9 @@ enabled_tools = [
   "file_list",
   "file_read",
   "env_read",
+  "database_connections",
+  "database_schema",
+  "database_query",
   "artisan_version",
   "artisan_about",
   "artisan_migrate_status",
@@ -268,6 +276,9 @@ enabled_tools = [
   "file_list",
   "file_read",
   "env_read",
+  "database_connections",
+  "database_schema",
+  "database_query",
   "artisan_version",
   "artisan_about",
   "artisan_migrate_status",
@@ -343,6 +354,7 @@ If you use forced-command, running `ssh codexdiag@prod.example.com` will wait fo
 - Keep this toolset **read-only**; enable mutations only for break-glass situations
 - Redact secrets; still treat outputs as sensitive
 - File reads are restricted to files that resolve under app root (`LARAVEL_DIAG_APP_DIR`)
+- SQL execution is restricted to read-only allowlisted statements
 
 ---
 
