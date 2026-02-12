@@ -1,4 +1,3 @@
-\
 /**
  * Best-effort redaction. This is NOT perfect and should not be relied on as the only guardrail.
  * We redact on both remote and local side to reduce accidental leakage.
