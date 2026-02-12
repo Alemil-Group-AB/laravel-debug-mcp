@@ -85,9 +85,9 @@ export async function callRemoteDiag(cfg: SshConfig, req: RemoteRequest): Promis
   child.stdin.write(json);
   child.stdin.end();
 
-  const exitCode: number = await new Promise((resolve, reject) => {
+  const exitCode: number = await new Promise<number>((resolve, reject) => {
     child.on("error", reject);
-    child.on("close", resolve);
+    child.on("close", (code) => resolve(code ?? -1));
   }).finally(() => clearTimeout(killTimer));
 
   stdout = normalizeNewlines(stdout).trim();
